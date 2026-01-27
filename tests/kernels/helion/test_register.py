@@ -21,10 +21,16 @@ if not has_helion():
         allow_module_level=True,
     )
 
+import helion.language as hl
+
 from vllm.kernels.helion.register import (
+    _REGISTERED_KERNELS,
     ConfiguredHelionKernel,
     HelionKernelWrapper,
     PresetConfigSearch,
+    get_kernel_by_name,
+    get_registered_kernels,
+    register_kernel,
     validate_helion_settings,
 )
 
@@ -468,3 +474,304 @@ class TestHelionKernelWrapper:
             assert isinstance(
                 mock_register.call_args[1]["op_func"], ConfiguredHelionKernel
             )
+
+
+class TestKernelRegistry:
+    """Test suite for kernel registry functions."""
+
+    @pytest.fixture(autouse=True)
+    def cleanup_registry(self):
+        """Clean up registered kernels before and after each test."""
+        # Store original registry state
+        original_kernels = _REGISTERED_KERNELS.copy()
+        _REGISTERED_KERNELS.clear()
+        yield
+        # Restore original registry state
+        _REGISTERED_KERNELS.clear()
+        _REGISTERED_KERNELS.update(original_kernels)
+
+    def test_get_registered_kernels_returns_copy(self):
+        """Test that get_registered_kernels returns a copy of the registry."""
+        mock_wrapper = Mock(spec=HelionKernelWrapper)
+        _REGISTERED_KERNELS["test_kernel"] = mock_wrapper
+
+        result = get_registered_kernels()
+
+        assert result == {"test_kernel": mock_wrapper}
+        # Verify it's a copy, not the original
+        result["another_kernel"] = Mock()
+        assert "another_kernel" not in _REGISTERED_KERNELS
+
+    def test_get_kernel_by_name_returns_kernel(self):
+        """Test that get_kernel_by_name returns the correct kernel."""
+        mock_wrapper = Mock(spec=HelionKernelWrapper)
+        _REGISTERED_KERNELS["test_kernel"] = mock_wrapper
+
+        result = get_kernel_by_name("test_kernel")
+
+        assert result is mock_wrapper
+
+    def test_get_kernel_by_name_returns_none_for_missing(self):
+        """Test that get_kernel_by_name returns None for missing kernel."""
+        result = get_kernel_by_name("nonexistent_kernel")
+
+        assert result is None
+
+
+class TestRegisterKernel:
+    """Test suite for register_kernel decorator."""
+
+    @pytest.fixture(autouse=True)
+    def cleanup_registry(self):
+        """Clean up registered kernels before and after each test."""
+        original_kernels = _REGISTERED_KERNELS.copy()
+        _REGISTERED_KERNELS.clear()
+        yield
+        _REGISTERED_KERNELS.clear()
+        _REGISTERED_KERNELS.update(original_kernels)
+
+    def test_register_kernel_auto_generates_fake_impl(self):
+        """Test that register_kernel auto-generates fake_impl when not provided."""
+
+        @register_kernel("silu_mul_fp8_test")
+        def silu_mul_fp8_test(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            """Simplified silu_mul_fp8 kernel for testing."""
+            d = input.shape[-1] // 2
+            output_shape = input.shape[:-1] + (d,)
+            out = torch.empty(
+                output_shape, device=input.device, dtype=torch.float8_e4m3fn
+            )
+
+            input_part_a = input[..., :d]
+            input_part_b = input[..., d:]
+
+            for tile_idx in hl.tile(out.shape):
+                a_vals = input_part_a[tile_idx].to(torch.float32)
+                silu_result = a_vals * torch.sigmoid(a_vals)
+                silu_result = silu_result.to(input.dtype)
+                b_vals = input_part_b[tile_idx]
+                result = silu_result * b_vals
+                result_f32 = result.to(torch.float32)
+                scale_val = hl.load(scale, [0])
+                result_scaled = result_f32 * (1.0 / scale_val)
+                out[tile_idx] = result_scaled.to(out.dtype)
+
+            return out
+
+        assert isinstance(silu_mul_fp8_test, HelionKernelWrapper)
+        assert silu_mul_fp8_test._fake_impl is not None
+        assert callable(silu_mul_fp8_test._fake_impl)
+
+        # Verify auto-generated fake_impl produces correct output shape and dtype
+        batch_size = 32
+        hidden_size = 4096
+        input_tensor = torch.randn(
+            batch_size, 2 * hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        scale = torch.tensor([0.5], dtype=torch.float32, device="cuda")
+
+        fake_output = silu_mul_fp8_test._fake_impl(input_tensor, scale)
+
+        expected_shape = (batch_size, hidden_size)
+        assert fake_output.shape == expected_shape, (
+            f"Expected shape {expected_shape}, got {fake_output.shape}"
+        )
+        assert fake_output.dtype == torch.float8_e4m3fn, (
+            f"Expected dtype float8_e4m3fn, got {fake_output.dtype}"
+        )
+        assert fake_output.device == input_tensor.device
+
+    def test_register_kernel_creates_wrapper(self):
+        """Test that register_kernel creates a HelionKernelWrapper."""
+
+        def fake_impl(x):
+            return torch.empty_like(x)
+
+        @register_kernel("test_kernel", fake_impl=fake_impl)
+        def test_kernel(x):
+            return x
+
+        assert isinstance(test_kernel, HelionKernelWrapper)
+        assert test_kernel.op_name == "test_kernel"
+        assert test_kernel._fake_impl is fake_impl
+
+    def test_register_kernel_auto_detects_name(self):
+        """Test that register_kernel auto-detects op name from function name."""
+
+        def fake_impl(x):
+            return torch.empty_like(x)
+
+        @register_kernel(fake_impl=fake_impl)
+        def my_kernel_func(x):
+            return x
+
+        assert my_kernel_func.op_name == "my_kernel_func"
+
+    def test_register_kernel_registers_in_global_registry(self):
+        """Test that register_kernel adds kernel to global registry."""
+
+        def fake_impl(x):
+            return torch.empty_like(x)
+
+        @register_kernel("test_kernel", fake_impl=fake_impl)
+        def test_kernel(x):
+            return x
+
+        assert "test_kernel" in _REGISTERED_KERNELS
+        assert _REGISTERED_KERNELS["test_kernel"] is test_kernel
+
+    def test_register_kernel_passes_helion_settings(self):
+        """Test that register_kernel passes helion_settings to wrapper."""
+
+        def fake_impl(x):
+            return torch.empty_like(x)
+
+        mock_settings = Mock()
+        mock_settings.to_dict.return_value = {"debug": True}
+
+        @register_kernel(
+            "test_kernel", fake_impl=fake_impl, helion_settings=mock_settings
+        )
+        def test_kernel(x):
+            return x
+
+        assert test_kernel.helion_settings is mock_settings
+
+    def test_register_kernel_supports_decorator_syntax(self):
+        """Test that register_kernel works with all decorator syntaxes."""
+
+        def fake_impl(x):
+            return torch.empty_like(x)
+
+        # With explicit name
+        @register_kernel("explicit_name", fake_impl=fake_impl)
+        def kernel1(x):
+            return x
+
+        # With parentheses but without explicit name
+        @register_kernel(fake_impl=fake_impl)
+        def kernel2(x):
+            return x
+
+        assert kernel1.op_name == "explicit_name"
+        assert kernel2.op_name == "kernel2"
+
+    def test_register_kernel_bare_decorator(self):
+        """Test that register_kernel works without parentheses."""
+
+        # Bare decorator usage: @register_kernel without parentheses
+        @register_kernel
+        def bare_kernel(x):
+            return x
+
+        assert isinstance(bare_kernel, HelionKernelWrapper)
+        assert bare_kernel.op_name == "bare_kernel"
+        assert bare_kernel._fake_impl is not None
+
+    def test_registered_wrapper_can_register_config_picker(self):
+        """Test that registered wrapper can use register_config_picker."""
+
+        def fake_impl(x):
+            return torch.empty_like(x)
+
+        @register_kernel("test_kernel", fake_impl=fake_impl)
+        def test_kernel(x):
+            return x
+
+        @test_kernel.register_config_picker
+        def pick_config(model_config, args, config_keys):
+            return "default"
+
+        assert test_kernel._config_picker is pick_config
+
+    def test_register_kernel_raises_on_duplicate_registration(self):
+        """Test that register_kernel raises error for duplicate registrations."""
+
+        def fake_impl(x):
+            return torch.empty_like(x)
+
+        @register_kernel("duplicate_test", fake_impl=fake_impl)
+        def kernel1(x):
+            return x
+
+        with pytest.raises(ValueError, match="already registered"):
+
+            @register_kernel("duplicate_test", fake_impl=fake_impl)
+            def kernel2(x):
+                return x * 2
+
+    def test_register_kernel_rejects_autotuner_fn_in_settings(self):
+        """Test that register_kernel rejects helion_settings with autotuner_fn."""
+
+        def fake_impl(x):
+            return torch.empty_like(x)
+
+        mock_settings = Mock()
+        mock_settings.to_dict.return_value = {"autotuner_fn": Mock()}
+
+        with pytest.raises(ValueError, match="uses a custom autotuner"):
+
+            @register_kernel(
+                "test_kernel", fake_impl=fake_impl, helion_settings=mock_settings
+            )
+            def test_kernel(x):
+                return x
+
+    def test_register_kernel_rejects_custom_key_in_settings(self):
+        """Test that register_kernel rejects helion_settings with custom_key."""
+
+        def fake_impl(x):
+            return torch.empty_like(x)
+
+        mock_settings = Mock()
+        mock_settings.to_dict.return_value = {"custom_key": lambda *args: "key"}
+
+        with pytest.raises(ValueError, match="uses a custom key function"):
+
+            @register_kernel(
+                "test_kernel", fake_impl=fake_impl, helion_settings=mock_settings
+            )
+            def test_kernel(x):
+                return x
+
+    def test_register_kernel_warns_with_static_shapes_true(self):
+        """Test that register_kernel warns when static_shapes=True."""
+
+        def fake_impl(x):
+            return torch.empty_like(x)
+
+        mock_settings = Mock()
+        mock_settings.to_dict.return_value = {"static_shapes": True}
+
+        with patch("vllm.kernels.helion.register.logger") as mock_logger:
+
+            @register_kernel(
+                "test_kernel", fake_impl=fake_impl, helion_settings=mock_settings
+            )
+            def test_kernel(x):
+                return x
+
+            # Verify warning was called with static_shapes message
+            mock_logger.warning.assert_called_once()
+            warning_msg = mock_logger.warning.call_args[0][0]
+            assert "static_shapes=True" in warning_msg
+
+    def test_register_kernel_no_warning_with_static_shapes_false(self):
+        """Test that register_kernel doesn't warn when static_shapes=False."""
+
+        def fake_impl(x):
+            return torch.empty_like(x)
+
+        mock_settings = Mock()
+        mock_settings.to_dict.return_value = {"static_shapes": False}
+
+        with patch("vllm.kernels.helion.register.logger") as mock_logger:
+
+            @register_kernel(
+                "test_kernel", fake_impl=fake_impl, helion_settings=mock_settings
+            )
+            def test_kernel(x):
+                return x
+
+            # Verify warning was NOT called
+            mock_logger.warning.assert_not_called()

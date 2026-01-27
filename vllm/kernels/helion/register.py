@@ -409,3 +409,177 @@ class HelionKernelWrapper:
             target_lib=vllm_helion_lib,
         )
         return getattr(torch.ops.vllm_helion, configured_op_name)
+
+
+# Global registry for tracking all registered HelionKernelWrapper instances
+_REGISTERED_KERNELS: dict[str, HelionKernelWrapper] = {}
+
+
+def get_registered_kernels() -> dict[str, HelionKernelWrapper]:
+    """
+    Get all registered Helion kernel wrappers from the global registry.
+
+    Returns:
+        Dictionary mapping kernel names to HelionKernelWrapper instances
+    """
+    return _REGISTERED_KERNELS.copy()
+
+
+def get_kernel_by_name(kernel_name: str) -> HelionKernelWrapper | None:
+    """
+    Get a specific registered kernel by name.
+
+    Args:
+        kernel_name: Name of the kernel to retrieve
+
+    Returns:
+        HelionKernelWrapper instance if found, None otherwise
+    """
+    return _REGISTERED_KERNELS.get(kernel_name)
+
+
+def infer_fake_impl(
+    kernel_func: Callable,
+    helion_settings: "helion.Settings | None" = None,
+) -> Callable:
+    """
+    Create an auto-generated fake implementation for a Helion kernel.
+
+    This function creates a fake_impl that uses Helion's bind/compile pattern
+    with a dummy launcher to generate output tensors with correct shapes and
+    dtypes without actually executing the kernel.
+
+    Args:
+        kernel_func: The raw Helion kernel function
+        helion_settings: Optional helion.Settings object for kernel configuration
+
+    Returns:
+        A callable fake implementation suitable for torch.compile
+    """
+
+    def helion_fake_kernel(*args, **kwargs):
+        """
+        Run the Helion kernel with a dummy launcher to generate correct
+        output shapes.
+
+        Uses Helion's bind/compile pattern where _launcher is passed to
+        the compiled runner. The dummy launcher skips actual execution
+        while still producing tensors with correct shapes/dtypes.
+        """
+        kernel_kwargs = {}
+        if helion_settings:
+            kernel_kwargs.update(helion_settings.to_dict())
+
+        temp_decorated_kernel = helion.kernel(**kernel_kwargs)(kernel_func)
+
+        # Bind with args to get config_spec, then get a valid default config
+        bound = temp_decorated_kernel.bind(args)
+        default_config = bound.config_spec.default_config()
+        compiled_runner = bound.compile_config(default_config)
+
+        return compiled_runner(*args, **kwargs, _launcher=lambda *a, **kw: None)
+
+    return helion_fake_kernel
+
+
+def register_kernel(
+    op_name_or_func: str | Callable | None = None,
+    *,
+    fake_impl: Callable | None = None,
+    helion_settings: "helion.Settings | None" = None,
+) -> Callable:
+    """
+    Decorator to register a Helion kernel function as a HelionKernelWrapper.
+
+    This decorator:
+    1. Wraps the raw kernel function in a HelionKernelWrapper
+    2. Registers the wrapper in the global kernel registry
+
+    The resulting HelionKernelWrapper can be used to create platform-specific
+    configured ops via create_configured_op_from_model().
+
+    Can be used with or without parentheses:
+        @register_kernel
+        def my_kernel(...): ...
+
+        @register_kernel("custom_name")
+        def my_kernel(...): ...
+
+    Args:
+        op_name_or_func: Name of the operation, or the decorated function when
+                used without parentheses. If None or a function, automatically
+                uses the decorated function's __name__.
+        fake_impl: Optional fake implementation for torch.compile compatibility.
+                  If not provided, one is auto-generated using Helion's
+                  bind/compile pattern with a dummy launcher.
+        helion_settings: Optional helion.Settings object for kernel configuration
+
+    Returns:
+        Decorator function that wraps the kernel and returns HelionKernelWrapper
+
+    Example:
+        # With auto-generated fake_impl:
+        @register_kernel("silu_mul_fp8", helion_settings=my_settings)
+        def silu_mul_fp8_kernel(x: torch.Tensor, scale: torch.Tensor):
+            # Helion kernel implementation
+            ...
+
+        # With custom fake_impl:
+        def silu_mul_fp8_fake(x: torch.Tensor, scale: torch.Tensor):
+            return torch.empty(x.shape, dtype=torch.float8_e4m3fn,
+                               device=x.device)
+
+        @register_kernel("silu_mul_fp8", fake_impl=silu_mul_fp8_fake)
+        def silu_mul_fp8_kernel(x: torch.Tensor, scale: torch.Tensor):
+            ...
+
+        # Register config picker:
+        @silu_mul_fp8_kernel.register_config_picker
+        def pick_config(model_config, args, config_keys):
+            ...
+
+        # Create configured op at runtime:
+        torch_op = silu_mul_fp8_kernel.create_configured_op_from_model(
+            model_config, config_manager)
+    """
+
+    def decorator(kernel_func: Callable) -> HelionKernelWrapper:
+        op_name = op_name_or_func if isinstance(op_name_or_func, str) else None
+        final_op_name = op_name if op_name else kernel_func.__name__
+
+        if final_op_name in _REGISTERED_KERNELS:
+            raise ValueError(
+                f"Helion kernel '{final_op_name}' is already registered. "
+                f"Use a different op_name or check for duplicate registrations."
+            )
+
+        final_fake_impl = fake_impl
+        if final_fake_impl is None:
+            final_fake_impl = infer_fake_impl(kernel_func, helion_settings)
+            logger.debug(
+                "Auto-generated fake_impl for Helion kernel '%s'",
+                kernel_func.__name__,
+            )
+
+        kernel_wrapper = HelionKernelWrapper(
+            raw_kernel_func=kernel_func,
+            op_name=final_op_name,
+            fake_impl=final_fake_impl,
+            helion_settings=helion_settings,
+        )
+
+        _REGISTERED_KERNELS[final_op_name] = kernel_wrapper
+
+        logger.info(
+            "Registered Helion kernel '%s' as HelionKernelWrapper",
+            kernel_func.__name__,
+        )
+
+        return kernel_wrapper
+
+    if callable(op_name_or_func) and not isinstance(op_name_or_func, str):
+        # Bare decorator usage: @register_kernel
+        return decorator(op_name_or_func)
+    else:
+        # Decorator with arguments: @register_kernel(...)
+        return decorator
