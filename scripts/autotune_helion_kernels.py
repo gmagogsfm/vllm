@@ -49,6 +49,8 @@ logger = init_logger("vllm.scripts.autotune_helion_kernels")
 
 @dataclass
 class AutotuneResult:
+    """Result of autotuning a kernel."""
+
     status: str  # "success" | "partial" | "error" | "skipped"
     successful: int
     failed: int
@@ -57,6 +59,7 @@ class AutotuneResult:
 
 
 def list_kernels() -> None:
+    """List all available Helion kernels."""
     kernels = get_registered_kernels()
 
     if not kernels:
@@ -73,6 +76,7 @@ def list_kernels() -> None:
 
 
 def check_requirements() -> bool:
+    """Check if CUDA and Helion are available."""
     if not torch.cuda.is_available():
         logger.error("CUDA is not available. Helion autotuning requires GPU.")
         return False
@@ -91,6 +95,7 @@ def autotune_kernel(
     force: bool = False,
     autotune_effort: str = "quick",
 ) -> AutotuneResult:
+    """Autotune a kernel and return result with autotuned configs."""
     logger.debug(
         "Starting autotune for kernel '%s' with effort='%s'",
         kernel_name,
@@ -109,19 +114,19 @@ def autotune_kernel(
         )
 
     try:
-        inputs_dict = kernel_wrapper.get_inputs()
-    except NotImplementedError:
-        error_msg = f"Kernel '{kernel_name}' has no input generator registered"
-        logger.error(error_msg)
-        return AutotuneResult(
-            status="error",
-            message=error_msg,
-            successful=0,
-            failed=0,
-            configs={},
-        )
+        try:
+            inputs_dict = kernel_wrapper.get_inputs()
+        except NotImplementedError:
+            error_msg = f"Kernel '{kernel_name}' has no input generator registered"
+            logger.error(error_msg)
+            return AutotuneResult(
+                status="error",
+                message=error_msg,
+                successful=0,
+                failed=0,
+                configs={},
+            )
 
-    try:
         logger.info(
             "Autotuning kernel '%s' for platform '%s' with %d configs",
             kernel_name,
@@ -131,6 +136,7 @@ def autotune_kernel(
 
         configs_to_autotune = {}
         if not force:
+            # Fetch existing configs once to avoid repeated I/O
             existing_configs = config_manager.get_platform_configs(
                 kernel_name, platform
             )
@@ -190,7 +196,7 @@ def autotune_kernel(
                     config_duration,
                 )
 
-            except (RuntimeError, ValueError, OSError) as e:
+            except Exception as e:
                 logger.exception(
                     "Failed to autotune config '%s': %s",
                     config_key,
@@ -218,7 +224,7 @@ def autotune_kernel(
             configs=autotuned_configs,
         )
 
-    except (KeyError, RuntimeError, ValueError, OSError) as e:
+    except Exception as e:
         error_msg = f"Unexpected error: {e}"
         logger.exception("Failed to autotune kernel '%s': %s", kernel_name, e)
         return AutotuneResult(
@@ -231,6 +237,7 @@ def autotune_kernel(
 
 
 def summarize_results(results: dict[str, AutotuneResult]) -> bool:
+    """Display results summary and return True if all succeeded."""
     logger.info("=" * 50)
     logger.info("Autotuning Results Summary")
     logger.info("=" * 50)
@@ -293,6 +300,7 @@ def summarize_results(results: dict[str, AutotuneResult]) -> bool:
 
 
 def get_kernels_to_autotune(requested_kernels: list[str] | None) -> list[str]:
+    """Return list of kernels to autotune, validating requested names."""
     all_kernels = get_registered_kernels()
     if not all_kernels:
         logger.error("No Helion kernels found in registry")
@@ -377,6 +385,7 @@ def main():
 
     args = parser.parse_args()
 
+    # Set up logging
     import logging
 
     if args.verbose:

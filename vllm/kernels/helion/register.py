@@ -65,6 +65,7 @@ vllm_helion_lib = Library("vllm_helion", "FRAGMENT")  # noqa
 def validate_helion_settings(
     helion_settings: "helion.Settings | None", op_name: str
 ) -> None:
+    """Validate that helion_settings doesn't contain conflicting options."""
     if helion_settings is None:
         return
 
@@ -97,6 +98,7 @@ def create_helion_decorated_kernel(
     helion_settings: "helion.Settings | None" = None,
     extra_kwargs: dict[str, Any] | None = None,
 ) -> Any:
+    """Apply @helion.kernel decorator with settings and extra kwargs."""
     kernel_kwargs: dict[str, Any] = {}
     if helion_settings:
         kernel_kwargs.update(helion_settings.to_dict())
@@ -106,6 +108,7 @@ def create_helion_decorated_kernel(
     if kernel_kwargs.get("static_shapes") is not True:
         kernel_kwargs["static_shapes"] = False
 
+    # Apply extra_kwargs last so they can override defaults
     if extra_kwargs:
         kernel_kwargs.update(extra_kwargs)
 
@@ -290,6 +293,15 @@ class HelionKernelWrapper:
         return generator_func
 
     def get_inputs(self) -> dict[str, tuple[Any, ...]]:
+        """
+        Get inputs for autotuning or benchmarking.
+
+        Returns:
+            Dict mapping config keys to input tuples.
+
+        Raises:
+            NotImplementedError: If no input generator is registered.
+        """
         if self._input_generator is None:
             raise NotImplementedError(
                 f"No input generator registered for kernel '{self.op_name}'. "
