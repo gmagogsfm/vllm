@@ -36,7 +36,10 @@ try:
         get_kernel_by_name,
         get_registered_kernels,
     )
-    from vllm.kernels.helion.utils import get_canonical_gpu_name
+    from vllm.kernels.helion.utils import (
+        canonicalize_gpu_name,
+        get_canonical_gpu_name,
+    )
     from vllm.logger import init_logger
     from vllm.utils.import_utils import has_helion
 except ImportError as e:
@@ -370,6 +373,17 @@ def main():
     )
 
     parser.add_argument(
+        "--platform",
+        type=str,
+        default=None,
+        help=(
+            "Override auto-detected platform name for config storage. "
+            "Uses canonical form, e.g. 'nvidia_h100', 'nvidia_a100'. "
+            "(default: auto-detect from GPU)"
+        ),
+    )
+
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging",
@@ -393,8 +407,12 @@ def main():
     if not check_requirements():
         sys.exit(1)
 
-    platform = get_canonical_gpu_name()
-    logger.info("Detected GPU platform: %s", platform)
+    if args.platform:
+        platform = canonicalize_gpu_name(args.platform)
+        logger.info("Using user-specified platform: %s", platform)
+    else:
+        platform = get_canonical_gpu_name()
+        logger.info("Detected GPU platform: %s", platform)
 
     config_manager = (
         ConfigManager(args.config_dir) if args.config_dir else ConfigManager()

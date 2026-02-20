@@ -429,6 +429,72 @@ def test_attention_config():
         engine_args.create_engine_config()
 
 
+def test_helion_platform():
+    from unittest.mock import patch
+
+    from vllm.config import KernelConfig
+
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    # default value is None
+    args = parser.parse_args([])
+    engine_args = EngineArgs.from_cli_args(args)
+    assert engine_args.helion_platform is None
+
+    # set via --helion-platform flag
+    args = parser.parse_args(["--helion-platform", "nvidia_a100"])
+    engine_args = EngineArgs.from_cli_args(args)
+    assert engine_args.helion_platform == "nvidia_a100"
+
+    # set via --kernel-config JSON
+    args = parser.parse_args(
+        ["--kernel-config", '{"helion_platform": "nvidia_h100"}']
+    )
+    engine_args = EngineArgs.from_cli_args(args)
+    assert engine_args.kernel_config == KernelConfig(helion_platform="nvidia_h100")
+
+    # --helion-platform flows into VllmConfig.kernel_config
+    with patch(
+        "vllm.engine.arg_utils._detect_helion_platform",
+        return_value=None,
+    ):
+        args = parser.parse_args(
+            ["--model", "facebook/opt-125m", "--helion-platform", "nvidia_a100"]
+        )
+        engine_args = EngineArgs.from_cli_args(args)
+        vllm_config = engine_args.create_engine_config()
+        assert vllm_config.kernel_config.helion_platform == "nvidia_a100"
+
+    # --helion-platform and --kernel-config.helion_platform are mutually exclusive
+    with patch(
+        "vllm.engine.arg_utils._detect_helion_platform",
+        return_value=None,
+    ):
+        args = parser.parse_args(
+            [
+                "--model",
+                "facebook/opt-125m",
+                "--helion-platform",
+                "nvidia_a100",
+                "--kernel-config",
+                '{"helion_platform": "nvidia_h100"}',
+            ]
+        )
+        engine_args = EngineArgs.from_cli_args(args)
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            engine_args.create_engine_config()
+
+    # auto-detection fills in helion_platform when not specified
+    with patch(
+        "vllm.engine.arg_utils._detect_helion_platform",
+        return_value="nvidia_h200",
+    ):
+        args = parser.parse_args(["--model", "facebook/opt-125m"])
+        engine_args = EngineArgs.from_cli_args(args)
+        vllm_config = engine_args.create_engine_config()
+        assert vllm_config.kernel_config.helion_platform == "nvidia_h200"
+
+
 def test_prefix_cache_default():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args([])

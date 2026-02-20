@@ -23,6 +23,7 @@ if not has_helion():
 
 import helion
 
+from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
 from vllm.kernels.helion.config_manager import ConfigManager
 from vllm.kernels.helion.register import (
     ConfiguredHelionKernel,
@@ -32,6 +33,21 @@ from vllm.kernels.helion.register import (
     register_kernel,
     validate_helion_settings,
 )
+
+
+def _mock_vllm_config(platform="nvidia_h200"):
+    """Create a mock VllmConfig with the given helion_platform."""
+    mock_config = Mock()
+    mock_config.kernel_config = KernelConfig(helion_platform=platform)
+    return mock_config
+
+
+def _patch_helion_platform(platform="nvidia_h200"):
+    """Patch get_current_vllm_config to return the given helion_platform."""
+    return patch(
+        "vllm.kernels.helion.register.get_current_vllm_config",
+        return_value=_mock_vllm_config(platform),
+    )
 
 
 @pytest.fixture
@@ -94,8 +110,8 @@ def configured_kernel(sample_kernel, sample_configs, config_manager_with_test_co
             return_value=config_manager_with_test_configs,
         ),
         patch(
-            "vllm.kernels.helion.utils.get_canonical_gpu_name",
-            return_value="nvidia_h200",
+            "vllm.kernels.helion.register.get_current_vllm_config",
+            return_value=_mock_vllm_config("nvidia_h200"),
         ),
         patch("vllm.kernels.helion.register.helion.kernel") as mock_kernel,
     ):
@@ -162,8 +178,8 @@ def create_configured_kernel_with_configs(
             return_value=mock_config_manager,
         ),
         patch(
-            "vllm.kernels.helion.utils.get_canonical_gpu_name",
-            return_value=platform,
+            "vllm.kernels.helion.register.get_current_vllm_config",
+            return_value=_mock_vllm_config(platform),
         ),
         patch("vllm.kernels.helion.register.helion.kernel") as mock_kernel,
     ):
@@ -193,8 +209,8 @@ class TestConfiguredHelionKernel:
                 return_value=mock_config_manager,
             ),
             patch(
-                "vllm.kernels.helion.utils.get_canonical_gpu_name",
-                return_value="nvidia_h200",
+                "vllm.kernels.helion.register.get_current_vllm_config",
+                return_value=_mock_vllm_config("nvidia_h200"),
             ),
             pytest.raises(RuntimeError, match="No config picker registered"),
         ):
@@ -271,8 +287,8 @@ class TestConfiguredHelionKernel:
                 return_value=mock_config_manager,
             ),
             patch(
-                "vllm.kernels.helion.utils.get_canonical_gpu_name",
-                return_value="nvidia_h200",
+                "vllm.kernels.helion.register.get_current_vllm_config",
+                return_value=_mock_vllm_config("nvidia_h200"),
             ),
         ):
             mock_decorated = Mock()
@@ -312,8 +328,8 @@ class TestConfiguredHelionKernel:
                 return_value=mock_config_manager,
             ),
             patch(
-                "vllm.kernels.helion.utils.get_canonical_gpu_name",
-                return_value="nvidia_h200",
+                "vllm.kernels.helion.register.get_current_vllm_config",
+                return_value=_mock_vllm_config("nvidia_h200"),
             ),
         ):
             mock_decorated = Mock()
@@ -353,8 +369,8 @@ class TestConfiguredHelionKernel:
                 return_value=mock_config_manager,
             ),
             patch(
-                "vllm.kernels.helion.utils.get_canonical_gpu_name",
-                return_value="nvidia_h200",
+                "vllm.kernels.helion.register.get_current_vllm_config",
+                return_value=_mock_vllm_config("nvidia_h200"),
             ),
         ):
             mock_decorated = Mock()
@@ -380,6 +396,55 @@ class TestConfiguredHelionKernel:
 
             assert key_result == "hiddensize_4096_batchsize_64"
             assert config is kernel.configs["hiddensize_4096_batchsize_64"]
+
+    def test_platform_override_from_kernel_config(
+        self, sample_kernel, sample_configs
+    ):
+        """Test that helion_platform set via KernelConfig is used for
+        config lookup instead of auto-detection."""
+        mock_config_manager = Mock(spec=ConfigManager)
+        mock_config_manager.get_platform_configs = Mock(return_value=sample_configs)
+
+        vllm_config = VllmConfig(
+            kernel_config=KernelConfig(helion_platform="nvidia_a100"),
+        )
+
+        with (
+            set_current_vllm_config(vllm_config),
+            patch(
+                "vllm.kernels.helion.config_manager.ConfigManager.get_instance",
+                return_value=mock_config_manager,
+            ),
+            patch("vllm.kernels.helion.register.helion.kernel"),
+        ):
+            kernel = ConfiguredHelionKernel(
+                op_name="test_kernel",
+                config_picker=lambda args, config_keys: "default",
+                raw_kernel_func=sample_kernel,
+                helion_settings=None,
+            )
+
+            assert kernel.platform == "nvidia_a100"
+            mock_config_manager.get_platform_configs.assert_called_once_with(
+                "test_kernel", "nvidia_a100"
+            )
+
+    def test_platform_none_raises_error(self, sample_kernel):
+        """Test that None helion_platform raises ValueError."""
+        vllm_config = VllmConfig(
+            kernel_config=KernelConfig(helion_platform=None),
+        )
+
+        with (
+            set_current_vllm_config(vllm_config),
+            pytest.raises(ValueError, match="Helion platform is not configured"),
+        ):
+            ConfiguredHelionKernel(
+                op_name="test_kernel",
+                config_picker=lambda args, keys: "default",
+                raw_kernel_func=sample_kernel,
+                helion_settings=None,
+            )
 
 
 class TestHelionKernelWrapper:
@@ -413,8 +478,8 @@ class TestHelionKernelWrapper:
                 return_value=mock_config_manager,
             ),
             patch(
-                "vllm.kernels.helion.utils.get_canonical_gpu_name",
-                return_value="nvidia_h200",
+                "vllm.kernels.helion.register.get_current_vllm_config",
+                return_value=_mock_vllm_config("nvidia_h200"),
             ),
             pytest.raises(ValueError, match="No configs available"),
         ):
@@ -444,8 +509,8 @@ class TestHelionKernelWrapper:
                 return_value=mock_config_manager,
             ),
             patch(
-                "vllm.kernels.helion.utils.get_canonical_gpu_name",
-                return_value="nvidia_h200",
+                "vllm.kernels.helion.register.get_current_vllm_config",
+                return_value=_mock_vllm_config("nvidia_h200"),
             ),
             pytest.raises(AssertionError, match="No config picker registered"),
         ):
@@ -480,8 +545,8 @@ class TestHelionKernelWrapper:
                 return_value=mock_config_manager,
             ),
             patch(
-                "vllm.kernels.helion.utils.get_canonical_gpu_name",
-                return_value="nvidia_h200",
+                "vllm.kernels.helion.register.get_current_vllm_config",
+                return_value=_mock_vllm_config("nvidia_h200"),
             ),
             patch.object(torch.ops, "vllm_helion", mock_namespace),
             patch("vllm.kernels.helion.register.helion.kernel") as mock_kernel,
@@ -530,8 +595,8 @@ class TestHelionKernelWrapper:
                 return_value=mock_config_manager,
             ),
             patch(
-                "vllm.kernels.helion.utils.get_canonical_gpu_name",
-                return_value="nvidia_h200",
+                "vllm.kernels.helion.register.get_current_vllm_config",
+                return_value=_mock_vllm_config("nvidia_h200"),
             ),
             patch.object(torch.ops, "vllm_helion", mock_namespace),
             patch(

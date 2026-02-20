@@ -17,6 +17,12 @@ class KernelConfig:
     enable_flashinfer_autotune: bool = Field(default=None)
     """If True, run FlashInfer autotuning during kernel warmup."""
 
+    helion_platform: str | None = Field(default=None)
+    """Override auto-detected GPU platform name for Helion kernel config
+    lookup. When set, Helion kernels will use this platform name instead of
+    auto-detecting from the GPU hardware. Use the canonical form, e.g.
+    'nvidia_h100', 'nvidia_a100'."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -29,9 +35,7 @@ class KernelConfig:
         excluding anything before input ids/embeddings and after
         the final hidden states.
         """
-        # no factors to consider.
-        # this config will not affect the computation graph.
-        factors: list[Any] = []
+        factors: list[Any] = [self.helion_platform]
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
@@ -42,3 +46,13 @@ class KernelConfig:
         if value is None:
             return value
         return handler(value)
+
+    @field_validator("helion_platform", mode="before")
+    @classmethod
+    def _validate_helion_platform(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        # Avoid top-level import to prevent circular import:
+        # vllm.config → vllm.kernels.helion.__init__ → vllm.config
+        from vllm.kernels.helion.utils import canonicalize_gpu_name
+        return canonicalize_gpu_name(str(value))

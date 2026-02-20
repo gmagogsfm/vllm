@@ -42,6 +42,8 @@ from typing import Any, cast, overload
 import torch
 from torch.library import Library
 
+from vllm.config import get_current_vllm_config
+from vllm.kernels.helion.config_manager import ConfigManager
 from vllm.logger import init_logger
 from vllm.utils.import_utils import has_helion
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -198,10 +200,13 @@ class ConfiguredHelionKernel:
         return config_selector
 
     def _load_platform_configs(self) -> None:
-        from vllm.kernels.helion.config_manager import ConfigManager
-        from vllm.kernels.helion.utils import get_canonical_gpu_name
-
-        self.platform = get_canonical_gpu_name()
+        self.platform = get_current_vllm_config().kernel_config.helion_platform
+        if self.platform is None:
+            raise ValueError(
+                "Helion platform is not configured. "
+                "Set --helion-platform explicitly or check that "
+                "platform auto-detection is working."
+            )
         config_manager = ConfigManager.get_instance()
         self.configs = config_manager.get_platform_configs(self.op_name, self.platform)
 

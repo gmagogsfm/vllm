@@ -86,6 +86,7 @@ from vllm.config.parallel import (
 from vllm.config.scheduler import SchedulerPolicy
 from vllm.config.utils import get_field
 from vllm.config.vllm import OptimizationLevel
+from vllm.kernels.helion.utils import get_canonical_gpu_name
 from vllm.logger import init_logger, suppress_logging
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.plugins import load_general_plugins
@@ -353,6 +354,16 @@ def get_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     return copy.deepcopy(_compute_kwargs(cls))
 
 
+def _detect_helion_platform() -> str | None:
+    """Auto-detect the Helion platform name from the current GPU.
+
+    Returns None on non-GPU platforms.
+    """
+    if not current_platform.is_cuda_alike():
+        return None
+    return get_canonical_gpu_name()
+
+
 @dataclass
 class EngineArgs:
     """Arguments for vLLM engine."""
@@ -546,6 +557,7 @@ class EngineArgs:
     enable_flashinfer_autotune: bool = get_field(
         KernelConfig, "enable_flashinfer_autotune"
     )
+    helion_platform: str | None = get_field(KernelConfig, "helion_platform")
     worker_cls: str = ParallelConfig.worker_cls
     worker_extension_cls: str = ParallelConfig.worker_extension_cls
 
@@ -1190,6 +1202,10 @@ class EngineArgs:
             "--enable-flashinfer-autotune",
             **kernel_kwargs["enable_flashinfer_autotune"],
         )
+        kernel_group.add_argument(
+            "--helion-platform",
+            **kernel_kwargs["helion_platform"],
+        )
 
         # vLLM arguments
         vllm_kwargs = get_kwargs(VllmConfig)
@@ -1781,6 +1797,17 @@ class EngineArgs:
                     "are mutually exclusive"
                 )
             kernel_config.enable_flashinfer_autotune = self.enable_flashinfer_autotune
+        if self.helion_platform is not None:
+            if kernel_config.helion_platform is not None:
+                raise ValueError(
+                    "helion_platform and "
+                    "kernel_config.helion_platform "
+                    "are mutually exclusive"
+                )
+            kernel_config.helion_platform = self.helion_platform
+
+        if kernel_config.helion_platform is None:
+            kernel_config.helion_platform = _detect_helion_platform()
 
         load_config = self.create_load_config()
 
