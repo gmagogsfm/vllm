@@ -42,6 +42,7 @@ def _get_int8_min_scaling_factor() -> float:
 
 @register_kernel(
     helion_settings=helion.Settings(
+        static_shapes=False,
         allow_warp_specialize=True,
         autotune_ignore_errors=True,
         ignore_warnings=[helion.exc.TensorOperationInWrapper],
