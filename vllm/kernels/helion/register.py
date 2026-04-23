@@ -53,7 +53,6 @@ if not has_helion():
     )
 
 import helion
-from helion._compat import requires_torch_version
 from helion.autotuner.base_search import BaseAutotuner
 from helion.runtime.config import Config
 from helion.runtime.settings import default_autotuner_fn
@@ -169,13 +168,20 @@ class ConfiguredHelionKernel:
         # After None check, config_picker is guaranteed to be non-None
         assert self.config_picker is not None
 
+        _config_keys_cached: list[str] | None = None
+        _config_keys_id: int | None = None
+
         def key_computer(*args):
-            config_keys = list(self.configs.keys())
-            # Cast is safe because we checked for None above
+            nonlocal _config_keys_cached, _config_keys_id
+            cur_id = id(self.configs)
+            if _config_keys_id != cur_id:
+                _config_keys_cached = list(self.configs.keys())
+                _config_keys_id = cur_id
             config_picker = cast(
                 Callable[[tuple[Any, ...], list[str]], str | None], self.config_picker
             )
-            selected_key = config_picker(args, config_keys)
+            assert _config_keys_cached is not None
+            selected_key = config_picker(args, _config_keys_cached)
             if selected_key:
                 return selected_key
             return "default" if "default" in self.configs else None

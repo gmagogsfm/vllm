@@ -7,7 +7,6 @@ from typing import Any
 
 import helion
 import helion.language as hl
-import regex as re
 import torch
 
 from vllm.logger import init_logger
@@ -36,19 +35,16 @@ def generate_inputs() -> dict[str, tuple[Any, ...]]:
         (2048, 2048),
         (2048, 12288),
         (6144, 2048),
-
         # Qwen3-8B
         (4096, 6144),
         (4096, 4096),
         (4096, 24576),
         (12288, 4096),
-
         # Qwen3.5-35B-A3B
         (2048, 1024),
         (512, 2048),
         (2048, 9216),
         (4096, 2048),
-
         # Meta-Llama-3.3-70B
         (8192, 10240),
         (8192, 8192),
@@ -96,20 +92,51 @@ def generate_inputs() -> dict[str, tuple[Any, ...]]:
     return inputs
 
 
-def pick_config(args: tuple[Any, ...], config_keys: list[str]) -> str | None:
-    """Pick the best pre-tuned config for the given input shape.
-    Selection strategy:
-      1. Find the closest hidden_size among available configs
-         (exact match preferred).
-      2. Find the closest feature_size among available configs
-         (exact match preferred).
-      3. Among the num_tokens values tuned for that hidden_size and feature_size, pick
-         the smallest num_tokens >= the input's num_tokens. If the input is
-         larger than all available num_tokens, fall back to the largest.
-    Config keys must be "default" or follow the format
-    "hidden_size_{int}_feature_size_{int}_num_tokens_{int}".
-    """
+_parsed_configs_cache: dict[int, dict[int, dict[int, list[int]]]] = {}
+_pick_config_result_cache: dict[tuple[int, int, int], str | None] = {}
 
+
+def _get_parsed_configs(
+    config_keys: list[str],
+) -> dict[int, dict[int, list[int]]]:
+    cache_key = id(config_keys)
+    if cache_key in _parsed_configs_cache:
+        return _parsed_configs_cache[cache_key]
+
+    configs: dict[int, dict[int, list[int]]] = {}
+    prefix = "hidden_size_"
+    mid = "_feature_size_"
+    suffix = "_num_tokens_"
+    for key in config_keys:
+        if key == "default":
+            continue
+        try:
+            rest = key[len(prefix) :]
+            idx1 = rest.index(mid)
+            hidden_size = int(rest[:idx1])
+            rest2 = rest[idx1 + len(mid) :]
+            idx2 = rest2.index(suffix)
+            feature_size = int(rest2[:idx2])
+            num_tokens = int(rest2[idx2 + len(suffix) :])
+        except (ValueError, IndexError) as e:
+            raise ValueError(
+                f"Malformed config key '{key}', "
+                f"expected format 'hidden_size_{{int}}_"
+                f"feature_size_{{int}}_num_tokens_{{int}}'"
+            ) from e
+        configs.setdefault(hidden_size, {}).setdefault(feature_size, []).append(
+            num_tokens
+        )
+
+    for hs in configs:
+        for fs in configs[hs]:
+            configs[hs][fs].sort()
+
+    _parsed_configs_cache[cache_key] = configs
+    return configs
+
+
+def pick_config(args: tuple[Any, ...], config_keys: list[str]) -> str | None:
     if not config_keys:
         return None
 
@@ -117,40 +144,34 @@ def pick_config(args: tuple[Any, ...], config_keys: list[str]) -> str | None:
     num_tokens, hidden_size = a.shape
     feature_size = b.shape[1]
 
-    configs: dict[int, dict[int, list[int]]] = {}
-    for key in config_keys:
-        if key == "default":
-            continue
-        match = re.fullmatch(
-            r"hidden_size_(\d+)_feature_size_(\d+)_num_tokens_(\d+)", key
-        )
-        if not match:
-            raise ValueError(
-                f"Malformed config key '{key}', "
-                f"expected format 'hidden_size_{{int}}_"
-                f"feature_size_{{int}}_num_tokens_{{int}}'"
-            )
-        hidden_size_str, feature_size_str, num_tokens_str = match.groups()
-        configs.setdefault(int(hidden_size_str), {}).setdefault(
-            int(feature_size_str), []
-        ).append(int(num_tokens_str))
+    shape_key = (int(num_tokens), int(hidden_size), int(feature_size))
+    cached = _pick_config_result_cache.get(shape_key)
+    if cached is not None:
+        return cached
+
+    configs = _get_parsed_configs(config_keys)
 
     if not configs:
-        return "default" if "default" in config_keys else None
+        result = "default" if "default" in config_keys else None
+        if result is not None:
+            _pick_config_result_cache[shape_key] = result
+        return result
 
     best_hidden_size = min(configs, key=lambda s: abs(s - hidden_size))
     best_feature_size = min(
         configs[best_hidden_size], key=lambda s: abs(s - feature_size)
     )
-    available_num_tokens = sorted(configs[best_hidden_size][best_feature_size])
+    available_num_tokens = configs[best_hidden_size][best_feature_size]
     best_num_tokens = next(
         (n for n in available_num_tokens if n >= num_tokens), available_num_tokens[-1]
     )
 
-    return (
+    result = (
         f"hidden_size_{best_hidden_size}_feature_size_"
         f"{best_feature_size}_num_tokens_{best_num_tokens}"
     )
+    _pick_config_result_cache[shape_key] = result
+    return result
 
 
 def fake_impl(

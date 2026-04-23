@@ -3,7 +3,6 @@
 
 from typing import Any
 
-import regex as re
 import torch
 
 from vllm.logger import init_logger
@@ -46,50 +45,72 @@ def generate_silu_mul_fp8_inputs() -> dict[str, tuple[Any, ...]]:
     return inputs
 
 
+_parsed_silu_configs_cache: dict[int, dict[int, list[int]]] = {}
+_pick_silu_result_cache: dict[tuple[int, int], str | None] = {}
+
+
+def _get_parsed_silu_configs(config_keys: list[str]) -> dict[int, list[int]]:
+    cache_key = id(config_keys)
+    if cache_key in _parsed_silu_configs_cache:
+        return _parsed_silu_configs_cache[cache_key]
+
+    configs: dict[int, list[int]] = {}
+    prefix = "intermediate_"
+    mid = "_numtokens_"
+    for key in config_keys:
+        if key == "default":
+            continue
+        try:
+            rest = key[len(prefix) :]
+            idx = rest.index(mid)
+            isize = int(rest[:idx])
+            ntokens = int(rest[idx + len(mid) :])
+        except (ValueError, IndexError) as e:
+            raise ValueError(
+                f"Malformed config key '{key}', "
+                f"expected format 'intermediate_{{int}}_numtokens_{{int}}'"
+            ) from e
+        configs.setdefault(isize, []).append(ntokens)
+
+    for isize in configs:
+        configs[isize].sort()
+
+    _parsed_silu_configs_cache[cache_key] = configs
+    return configs
+
+
 def pick_silu_mul_fp8_config(
     args: tuple[Any, ...], config_keys: list[str]
 ) -> str | None:
-    """Pick the best pre-tuned config for the given input shape.
-
-    Selection strategy:
-      1. Find the closest intermediate_size among available configs
-         (exact match preferred).
-      2. Among the num_tokens values tuned for that intermediate_size, pick
-         the smallest num_tokens >= the input's num_tokens. If the input is
-         larger than all available num_tokens, fall back to the largest.
-
-    Config keys must be "default" or follow the format
-    "intermediate_{int}_numtokens_{int}".
-    """
     if not config_keys:
         return None
 
     input_tensor, _scale = args
     intermediate_size = input_tensor.shape[-1] // 2
     num_tokens = input_tensor.view(-1, input_tensor.shape[-1]).shape[0]
-    configs: dict[int, list[int]] = {}
-    for key in config_keys:
-        if key == "default":
-            continue
-        match = re.fullmatch(r"intermediate_(\d+)_numtokens_(\d+)", key)
-        if not match:
-            raise ValueError(
-                f"Malformed config key '{key}', "
-                f"expected format 'intermediate_{{int}}_numtokens_{{int}}'"
-            )
-        isize_str, ntokens_str = match.groups()
-        configs.setdefault(int(isize_str), []).append(int(ntokens_str))
+
+    shape_key = (int(num_tokens), int(intermediate_size))
+    cached = _pick_silu_result_cache.get(shape_key)
+    if cached is not None:
+        return cached
+
+    configs = _get_parsed_silu_configs(config_keys)
 
     if not configs:
-        return "default" if "default" in config_keys else None
+        result = "default" if "default" in config_keys else None
+        if result is not None:
+            _pick_silu_result_cache[shape_key] = result
+        return result
 
     best_isize = min(configs, key=lambda s: abs(s - intermediate_size))
-    available_ntokens = sorted(configs[best_isize])
+    available_ntokens = configs[best_isize]
     best_ntokens = next(
         (n for n in available_ntokens if n >= num_tokens), available_ntokens[-1]
     )
 
-    return f"intermediate_{best_isize}_numtokens_{best_ntokens}"
+    result = f"intermediate_{best_isize}_numtokens_{best_ntokens}"
+    _pick_silu_result_cache[shape_key] = result
+    return result
 
 
 @register_kernel(
