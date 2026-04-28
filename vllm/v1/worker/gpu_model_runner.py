@@ -5753,6 +5753,18 @@ class GPUModelRunner(
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
+        import os as _os
+        import time as _time
+
+        _pr_t0 = _time.perf_counter()
+        self._profile_run_impl()
+        _pr_dt = _time.perf_counter() - _pr_t0
+        _mf = _os.environ.get("HELION_INSTRUMENT_FILE")
+        if _mf:
+            with open(_mf, "a") as _f:
+                _f.write(f"profile_run {_pr_dt:.3f}s\n")
+
+    def _profile_run_impl(self) -> None:
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
@@ -6128,6 +6140,22 @@ class GPUModelRunner(
         )
 
     def _capture_cudagraphs(
+        self,
+        batch_descriptors: list[BatchDescriptor],
+        cudagraph_runtime_mode: CUDAGraphMode,
+    ):
+        import os as _os
+        import time as _time
+
+        _cg_t0 = _time.perf_counter()
+        self._capture_cudagraphs_impl(batch_descriptors, cudagraph_runtime_mode)
+        _cg_dt = _time.perf_counter() - _cg_t0
+        _mf = _os.environ.get("HELION_INSTRUMENT_FILE")
+        if _mf:
+            with open(_mf, "a") as _f:
+                _f.write(f"capture_cudagraphs {_cg_dt:.3f}s\n")
+
+    def _capture_cudagraphs_impl(
         self,
         batch_descriptors: list[BatchDescriptor],
         cudagraph_runtime_mode: CUDAGraphMode,

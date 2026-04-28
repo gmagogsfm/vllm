@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
 from itertools import product
 from typing import Any
 
@@ -8,6 +10,7 @@ import helion
 import helion.language as hl
 import torch
 
+from vllm.kernels.helion.case_key import CaseKey
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
@@ -39,7 +42,7 @@ def _get_int8_min_scaling_factor() -> float:
     return torch.finfo(torch.float32).eps
 
 
-def generate_inputs() -> dict[str, tuple[Any, ...]]:
+def generate_inputs() -> dict[CaseKey, tuple[Any, ...]]:
     # TODO(xiaohongchen1991): it is difficult for kernel author to cover all
     # input property combination. Currently, dtypes are fixed. We need
     # optimization to bucket/skip some combinations
@@ -48,7 +51,7 @@ def generate_inputs() -> dict[str, tuple[Any, ...]]:
     in_dtype: torch.dtype = torch.bfloat16
     out_dtype: torch.dtype = current_platform.fp8_dtype()
     scale_dtype: torch.dtype = torch.float32
-    inputs = {}
+    inputs: dict[CaseKey, tuple[Any, ...]] = {}
 
     for num_tokens, hidden_size in product(num_tokens_list, hidden_size_list):
         input = torch.randn(num_tokens, hidden_size, device="cuda", dtype=in_dtype)
@@ -65,47 +68,16 @@ def generate_inputs() -> dict[str, tuple[Any, ...]]:
         )
         epsilon = 1e-6
 
-        config_key = f"hidden_size_{hidden_size}_num_tokens_{num_tokens}"
-        inputs[config_key] = (result, input, weight, scale, epsilon, scale_ub, residual)
+        key = CaseKey({"hidden_size": hidden_size, "num_tokens": num_tokens})
+        inputs[key] = (result, input, weight, scale, epsilon, scale_ub, residual)
 
     return inputs
 
 
-_parsed_configs_cache: dict[int, dict[int, list[int]]] = {}
-_pick_config_result_cache: dict[tuple[int, int], str | None] = {}
+_pick_config_result_cache: dict[tuple[int, int], CaseKey | None] = {}
 
 
-def _get_parsed_configs(config_keys: list[str]) -> dict[int, list[int]]:
-    cache_key = id(config_keys)
-    if cache_key in _parsed_configs_cache:
-        return _parsed_configs_cache[cache_key]
-
-    configs: dict[int, list[int]] = {}
-    prefix = "hidden_size_"
-    mid = "_num_tokens_"
-    for key in config_keys:
-        if key == "default":
-            continue
-        try:
-            rest = key[len(prefix) :]
-            idx = rest.index(mid)
-            hidden_size = int(rest[:idx])
-            num_tokens = int(rest[idx + len(mid) :])
-        except (ValueError, IndexError) as e:
-            raise ValueError(
-                f"Malformed config key '{key}', "
-                f"expected format 'hidden_size_{{int}}_num_tokens_{{int}}'"
-            ) from e
-        configs.setdefault(hidden_size, []).append(num_tokens)
-
-    for hs in configs:
-        configs[hs].sort()
-
-    _parsed_configs_cache[cache_key] = configs
-    return configs
-
-
-def pick_config(args: tuple[Any, ...], config_keys: list[str]) -> str | None:
+def pick_config(args: tuple[Any, ...], config_keys: list[CaseKey]) -> CaseKey | None:
     if not config_keys:
         return None
 
@@ -117,21 +89,25 @@ def pick_config(args: tuple[Any, ...], config_keys: list[str]) -> str | None:
     if cached is not None:
         return cached
 
-    configs = _get_parsed_configs(config_keys)
+    by_hs: dict[int, list[int]] = {}
+    for k in config_keys:
+        if k.is_default():
+            continue
+        by_hs.setdefault(k["hidden_size"], []).append(k["num_tokens"])
 
-    if not configs:
-        result = "default" if "default" in config_keys else None
-        if result is not None:
-            _pick_config_result_cache[shape_key] = result
-        return result
+    if not by_hs:
+        return None
 
-    best_hidden_size = min(configs, key=lambda s: abs(s - hidden_size))
-    available_num_tokens = configs[best_hidden_size]
+    for hs in by_hs:
+        by_hs[hs].sort()
+
+    best_hidden_size = min(by_hs, key=lambda s: abs(s - hidden_size))
+    available_num_tokens = by_hs[best_hidden_size]
     best_num_tokens = next(
         (n for n in available_num_tokens if n >= num_tokens), available_num_tokens[-1]
     )
 
-    result = f"hidden_size_{best_hidden_size}_num_tokens_{best_num_tokens}"
+    result = CaseKey({"hidden_size": best_hidden_size, "num_tokens": best_num_tokens})
     _pick_config_result_cache[shape_key] = result
     return result
 

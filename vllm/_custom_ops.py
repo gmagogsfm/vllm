@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -13,12 +14,9 @@ from vllm.utils.flashinfer import (
     flashinfer_quant_nvfp4_8x4_sf_layout,
 )
 from vllm.utils.math_utils import cdiv
-from vllm.kernels.helion.ops.scaled_mm import (
-    scaled_mm,
-)
-from vllm.kernels.helion.ops.dynamic_per_token_scaled_fp8_quant import (
-    dynamic_per_token_scaled_fp8_quant,
-)
+
+if not os.environ.get("VLLM_DISABLE_HELION"):
+    pass
 
 logger = init_logger(__name__)
 
@@ -907,11 +905,15 @@ def cutlass_scaled_mm(
         )
 
         out = triton_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias)
+    elif (
+        os.environ.get("VLLM_DISABLE_HELION")
+        or not hasattr(torch.ops, "vllm_helion")
+        or not hasattr(torch.ops.vllm_helion, "scaled_mm")
+    ):
+        out = torch.empty((a.shape[0], b.shape[1]), dtype=out_dtype, device=a.device)
+        torch.ops._C.cutlass_scaled_mm(out, a, b, scale_a, scale_b, bias)
     else:
-        # out = torch.empty((a.shape[0], b.shape[1]), dtype=out_dtype, device=a.device)
-        # torch.ops._C.cutlass_scaled_mm(out, a, b, scale_a, scale_b, bias)
         out = torch.ops.vllm_helion.scaled_mm(a, b, scale_a, scale_b, out_dtype, bias)
-        # out = scaled_mm(a, b, scale_a, scale_b, out_dtype, bias)
 
     return out.view(*target_shape)
 
@@ -1914,12 +1916,20 @@ def scaled_fp8_quant(
     if scale is None:
         if use_per_token_if_dynamic:
             scale = torch.empty((shape[0], 1), device=input.device, dtype=torch.float32)
-            # torch.ops._C.dynamic_per_token_scaled_fp8_quant(
-            #     output, input, scale, scale_ub
-            # )
-            torch.ops.vllm_helion.dynamic_per_token_scaled_fp8_quant(
-                output, input, scale, scale_ub
-            )
+            if (
+                os.environ.get("VLLM_DISABLE_HELION")
+                or not hasattr(torch.ops, "vllm_helion")
+                or not hasattr(
+                    torch.ops.vllm_helion, "dynamic_per_token_scaled_fp8_quant"
+                )
+            ):
+                torch.ops._C.dynamic_per_token_scaled_fp8_quant(
+                    output, input, scale, scale_ub
+                )
+            else:
+                torch.ops.vllm_helion.dynamic_per_token_scaled_fp8_quant(
+                    output, input, scale, scale_ub
+                )
         else:
             scale = torch.empty(1, device=input.device, dtype=torch.float32)
             torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)

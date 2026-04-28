@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -25,9 +26,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
-from vllm.kernels.helion.ops.dynamic_per_token_scaled_fp8_quant import (
-    dynamic_per_token_scaled_fp8_quant,
-)
 
 RMS_ADD_OP = torch.ops._C.fused_add_rms_norm.default
 ROTARY_OP = torch.ops._C.rotary_embedding.default
@@ -36,9 +34,19 @@ FLASHINFER_ROTARY_OP = torch.ops.vllm.flashinfer_rotary_embedding.default
 QUANT_OPS: dict[QuantKey, OpOverload] = {
     kFp8StaticTensorSym: torch.ops._C.static_scaled_fp8_quant.default,  # noqa: E501
     kFp8DynamicTensorSym: torch.ops._C.dynamic_scaled_fp8_quant.default,  # noqa: E501
-    # kFp8DynamicTokenSym: torch.ops._C.dynamic_per_token_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTokenSym: torch.ops.vllm_helion.dynamic_per_token_scaled_fp8_quant.default,  # noqa: E501
 }
+if (
+    not os.environ.get("VLLM_DISABLE_HELION")
+    and hasattr(torch.ops, "vllm_helion")
+    and hasattr(torch.ops.vllm_helion, "dynamic_per_token_scaled_fp8_quant")
+):
+    QUANT_OPS[kFp8DynamicTokenSym] = (
+        torch.ops.vllm_helion.dynamic_per_token_scaled_fp8_quant.default
+    )  # noqa: E501
+else:
+    QUANT_OPS[kFp8DynamicTokenSym] = (
+        torch.ops._C.dynamic_per_token_scaled_fp8_quant.default
+    )  # noqa: E501
 
 if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
     QUANT_OPS[kNvfp4Dynamic] = torch.ops._C.scaled_fp4_quant.out  # noqa: E501
